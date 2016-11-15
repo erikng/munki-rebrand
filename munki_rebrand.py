@@ -27,7 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 from subprocess import Popen, PIPE
 from os import listdir, stat, chmod, geteuid, mkdir, rename, getcwd
 from os.path import join, isfile, isdir
-from shutil import copyfile, copy, rmtree
+from shutil import copyfile, rmtree, move
 from tempfile import mkdtemp
 import fileinput
 import argparse
@@ -121,7 +121,7 @@ def find_replace(find, replace, files, verbose=False):
 
 
 def convert_to_icns(png, verbose=False):
-    '''Takes a png file and attempts to convert it to an icns set'''
+    ''' Takes a png file and attempts to convert it to an icns set '''
     iconset = join(tmp_dir, 'AppIcns.iconset')
     mkdir(iconset)
     for hw, suffix in ICON_SIZES:
@@ -133,6 +133,26 @@ def convert_to_icns(png, verbose=False):
             '-o', icns]
     run_cmd(cmd, verbose=verbose)
     return icns
+
+def productsign_pkg(pkg_path, cert, keychain=None, verbose=False):
+    ''' Signs a Mac pkg using an Installer Certificate '''
+    # First unlock the keychain from the command line
+    if keychain:
+        cmd = ['/usr/bin/security', 'unlock-keychain', keychain]
+        run_cmd(cmd, verbose=verbose)
+    # Now sign the package
+    signed_path = '%s.signed' % pkg_path
+    cmd = ['/usr/bin/productsign']
+    if keychain:
+        cmd.extend(['--keychain', keychain])
+    cmd.extend(['--sign', cert, pkg_path, signed_path])
+    run_cmd(cmd, verbose=verbose)
+    if keychain:
+        cmd = ['/usr/bin/security', 'lock-keychain', keychain]
+        run_cmd(cmd, verbose=verbose)
+    # And replace the unsigned pkg with the signed one
+    move(signed_path, pkg_path)
+
 
 
 def main():
@@ -173,6 +193,13 @@ def main():
                    default=None,
                    help="Optional tag to download a specific release of munki "
                    "e.g. 'v2.8.2'. Leave blank for latest Github code.")
+    p.add_argument('-s', '--sign-with', action='store',
+                   default=None,
+                   help="Certificate to use to sign the resulting munki pkg."),
+    p.add_argument('-k', '--keychain', action='store',
+                   default=None,
+                   help="Path to keychain containing signing cert (if not in "
+                   "System keychain).")
     p.add_argument('-v', '--verbose', action='store_true',
                    help="Be more verbose.")
     args = p.parse_args()
@@ -181,13 +208,19 @@ def main():
     precheck_errors = []
     if args.icon_file and not isfile(args.icon_file):
         precheck_errors.append(
-            'Icon file %s does not exist' % args.icon_file)
+            'Icon file %s does not exist.' % args.icon_file)
     if args.postinstall and not isfile(args.postinstall):
         precheck_errors.append(
             'postinstall script %s does not exist.' % args.postinstall)
+    if args.keychain and not args.sign_with:
+        precheck_errors.append(
+            '-k/--keychain specified without -s/--sign-with argument.')
+    if args.keychain and not isfile(args.keychain):
+        precheck_errors.append(
+            'Keychain file %s does not exist.' % args.keychain)
     if precheck_errors:
         for error in precheck_errors:
-            print error
+            print "ERROR: %s" % error
             sys.exit(1)
 
     # Clone git repo
@@ -214,7 +247,8 @@ def main():
     if args.localized:
         print "Replacing localized app names with %s..." % args.appname
         for app_dir in APP_DIRS.values():
-            ls = [name for name in listdir(join(tmp_dir, app_dir)) if isdir(join(tmp_dir, app_dir, name))]
+            ls = [name for name in listdir(join(tmp_dir, app_dir))
+                  if isdir(join(tmp_dir, app_dir, name))]
             for lproj_dir in ls:
                 for code, local_name in APPNAME_ORIG_LOCALIZED.iteritems():
                     if lproj_dir.endswith('%s.lproj' % code):
@@ -235,12 +269,11 @@ def main():
         if args.icon_file.endswith('.png'):
             # Attempt to convert png to icns
             print "Converting .png file to .icns..."
-            args.icon_file = convert_to_icns(args.icon_file, verbose=args.verbose)
+            args.icon_file = convert_to_icns(args.icon_file,
+                                             verbose=args.verbose)
         print "Replacing icons with %s..." % args.icon_file
-        for dest in [join(tmp_dir,
-                            '%s/Managed Software Center.icns' % APP_DIRS['MSC_DIR']),
-                        join(tmp_dir,
-                            '%s/MunkiStatus.icns' % APP_DIRS['MS_DIR'])]:
+        for dest in [join(tmp_dir, '%s/Managed Software Center.icns' % APP_DIRS['MSC_DIR']),
+                     join(tmp_dir, '%s/MunkiStatus.icns' % APP_DIRS['MS_DIR'])]:
             copyfile(args.icon_file, dest)
 
 
@@ -262,6 +295,13 @@ def main():
         retgrep='Distribution package created at .*(?P<munki_pkg>munkitools.*pkg).',
         verbose=args.verbose)
     munki_pkg = group.groupdict()['munki_pkg']
+
+    if args.sign_with:
+        print "Signing pkg with cert '%s'" % args.sign_with
+        productsign_pkg(join(tmp_dir, munki_pkg),
+                        args.sign_with,
+                        keychain=args.keychain,
+                        verbose=args.verbose)
 
     if args.output_file:
         # Rename the pkg to whatever is in args.outfile
